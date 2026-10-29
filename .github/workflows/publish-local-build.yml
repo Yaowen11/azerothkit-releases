@@ -1,0 +1,90 @@
+name: Publish locally validated installers
+on:
+  push:
+    branches: ['local-build/**']
+permissions:
+  contents: write
+concurrency:
+  group: local-publish-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: github.repository == 'Yaowen11/azerothkit-releases'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Reassemble and verify the exact three release assets
+        id: assets
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os,re
+          from pathlib import Path
+          match=re.fullmatch(r'local-build/(macos|windows)/(\d{8}T\d{6}Z-[a-f0-9]{8})',os.environ['GITHUB_REF_NAME'])
+          assert match, 'Invalid build branch'
+          platform,identifier=match.groups()
+          root=Path('payload')
+          request=json.loads((root/'request.json').read_text())
+          assert request.get('format')==1 and request.get('platform')==platform
+          manifest_name='client-release.json' if platform=='macos' else 'windows-client-release.json'
+          m=json.loads((root/manifest_name).read_text())
+          version=m['version']; assert re.fullmatch(r'\d+\.\d+\.\d+',version)
+          filename=f'AzerothAddonManager-{version}-arm64.dmg' if platform=='macos' else f'AzerothAddonManager-{version}-windows-x64-setup.exe'
+          assert m.get('format')==1 and m['filename']==filename and m['channel']=='development'
+          assert m['architecture']==('arm64' if platform=='macos' else 'x64')
+          assert (m.get('notarized') is False) if platform=='macos' else (m.get('platform')=='windows' and m.get('signed') is False)
+          assert type(m['bytes']) is int and 0<m['bytes']<=512*1024*1024
+          assert re.fullmatch('[a-f0-9]{64}',m['sha256'])
+          parts=request['parts']; assert isinstance(parts,list) and 1<=len(parts)<=26 and len(set(parts))==len(parts)
+          assert parts==[f'part-{i:03d}' for i in range(len(parts))]
+          expected=set(parts)|{'request.json',manifest_name,filename+'.sha256'}
+          assert {p.name for p in root.iterdir()}==expected and all(p.is_file() and not p.is_symlink() for p in root.iterdir())
+          output=Path('publish'); output.mkdir()
+          total=0; digest=hashlib.sha256()
+          with (output/filename).open('wb') as target:
+              for part in parts:
+                  data=(root/part).read_bytes(); assert 0<len(data)<=20*1024*1024
+                  total+=len(data); assert total<=m['bytes']
+                  digest.update(data); target.write(data)
+          assert total==m['bytes'] and digest.hexdigest()==m['sha256']
+          checksum=(m['sha256']+'  '+filename).encode()
+          assert (root/(filename+'.sha256')).read_bytes().strip()==checksum
+          (output/(filename+'.sha256')).write_bytes(checksum+b'\n')
+          (output/manifest_name).write_bytes((root/manifest_name).read_bytes())
+          tag=('local-' if platform=='macos' else 'windows-local-')+identifier
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:
+              for key,value in [('name',filename),('manifest',manifest_name),('tag',tag),('version',version),('platform',platform)]:f.write(key+'='+value+'\n')
+          PY
+      - name: Publish verified binary assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: Yaowen11/azerothkit-releases
+          ASSET_NAME: ${{ steps.assets.outputs.name }}
+          MANIFEST_NAME: ${{ steps.assets.outputs.manifest }}
+          RELEASE_TAG: ${{ steps.assets.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.assets.outputs.version }}
+          RELEASE_PLATFORM: ${{ steps.assets.outputs.platform }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          existing=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft 2>/dev/null || true)
+          if [[ "$existing" == false ]]; then exit 0; fi
+          cat > release-notes.txt <<'NOTES'
+          AzerothKit locally validated development build.
+          Native checks, package and installer verification were performed on the developer machine.
+          macOS builds are not notarized; Windows builds are not Authenticode signed.
+          Verify SHA-256 before installation. Only installers and update manifests are published; no private application source is included.
+          NOTES
+          if [[ "$existing" != true ]]; then
+            gh release create "$RELEASE_TAG" --target main --draft --prerelease --title "$RELEASE_PLATFORM $RELEASE_VERSION (local build)" --notes-file release-notes.txt
+          fi
+          gh release upload "$RELEASE_TAG" "publish/$ASSET_NAME" "publish/$ASSET_NAME.sha256" "publish/$MANIFEST_NAME" --clobber
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease
+      - name: Remove completed staging branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: Yaowen11/azerothkit-releases
+        run: gh api --method DELETE "repos/$GH_REPO/git/refs/heads/$GITHUB_REF_NAME"
