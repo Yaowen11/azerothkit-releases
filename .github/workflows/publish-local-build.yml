@@ -35,7 +35,7 @@ jobs:
           filename=f'AzerothAddonManager-{version}-arm64.dmg' if platform=='macos' else f'AzerothAddonManager-{version}-windows-x64-setup.exe'
           assert m.get('format')==1 and m['filename']==filename and m['channel']=='development'
           assert m['architecture']==('arm64' if platform=='macos' else 'x64')
-          assert (m.get('notarized') is False) if platform=='macos' else (m.get('platform')=='windows' and m.get('signed') is False)
+          assert (type(m.get('notarized')) is bool) if platform=='macos' else (m.get('platform')=='windows' and m.get('signed') is False)
           assert type(m['bytes']) is int and 0<m['bytes']<=512*1024*1024
           assert re.fullmatch('[a-f0-9]{64}',m['sha256'])
           parts=request['parts']; assert isinstance(parts,list) and 1<=len(parts)<=26 and len(set(parts))==len(parts)
@@ -56,7 +56,7 @@ jobs:
           (output/manifest_name).write_bytes((root/manifest_name).read_bytes())
           tag=('local-' if platform=='macos' else 'windows-local-')+identifier
           with open(os.environ['GITHUB_OUTPUT'],'a') as f:
-              for key,value in [('name',filename),('manifest',manifest_name),('tag',tag),('version',version),('platform',platform)]:f.write(key+'='+value+'\n')
+              for key,value in [('name',filename),('manifest',manifest_name),('tag',tag),('version',version),('platform',platform),('notarized',str(m.get('notarized',False)).lower())]:f.write(key+'='+value+'\n')
           PY
       - name: Publish verified binary assets
         env:
@@ -67,6 +67,7 @@ jobs:
           RELEASE_TAG: ${{ steps.assets.outputs.tag }}
           RELEASE_VERSION: ${{ steps.assets.outputs.version }}
           RELEASE_PLATFORM: ${{ steps.assets.outputs.platform }}
+          RELEASE_NOTARIZED: ${{ steps.assets.outputs.notarized }}
         shell: bash
         run: |
           set -euo pipefail
@@ -75,7 +76,7 @@ jobs:
           cat > release-notes.txt <<'NOTES'
           AzerothKit locally validated development build.
           Native checks, package and installer verification were performed on the developer machine.
-          macOS builds are not notarized; Windows builds are not Authenticode signed.
+          Consult the release manifest for notarization or signing status.
           Verify SHA-256 before installation. Only installers and update manifests are published; no private application source is included.
           NOTES
           if [[ "$existing" != true ]]; then
